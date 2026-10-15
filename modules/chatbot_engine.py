@@ -1,7 +1,8 @@
 """
 modules/chatbot_engine.py
 Interactive AI chatbot engine grounded in the uploaded dataset schema, profile, and sample rows.
-Uses safe API key retrieval, native string formatting, and gemini-3.8-flash model resolution.
+Uses safe API key retrieval, native string formatting, gemini-3.8-flash model resolution,
+and an automated analytical fallback engine for HTTP 429 rate limits.
 """
 import os
 import streamlit as st
@@ -62,31 +63,76 @@ def _get_supported_model_name(api_key: str) -> str:
     return "gemini-3.8-flash"
 
 
+def _build_rate_limit_fallback(df: pd.DataFrame, schema_info: dict, last_user_msg: str) -> str:
+    """
+    Constructs an immediate, data-backed strategic answer when the Google Free-Tier 
+    5 RPM rate limit is reached.
+    """
+    num_cols = schema_info.get("numeric_columns", [])
+    cat_cols = [c for c in df.columns if df[c].dtype == "object" or df[c].dtype.name == "category"]
+
+    lead_cat = cat_cols[0] if cat_cols else None
+    lead_metric = num_cols[0] if num_cols else None
+
+    # Check if user mentioned a specific column or category in their prompt
+    q_lower = last_user_msg.lower()
+    for c in cat_cols:
+        matched_vals = [val for val in df[c].dropna().unique() if str(val).lower() in q_lower]
+        if matched_vals:
+            lead_cat = c
+            break
+
+    if lead_cat and lead_metric:
+        grouped = df.groupby(lead_cat)[lead_metric].sum().sort_values(ascending=False)
+        top_name = grouped.index[0]
+        top_val = grouped.iloc[0]
+        bottom_name = grouped.index[-1]
+        bottom_val = grouped.iloc[-1]
+        total_val = grouped.sum()
+        top_share = (top_val / total_val * 100) if total_val > 0 else 0
+
+        return (
+            f"⚡ **Immediate Analysis (Quota Recovery Mode)**\n\n"
+            f"*The Google AI Free-Tier rate limit (5 requests/min) was reached. Here are direct strategic takeaways derived from your active numbers:*\n\n"
+            f"1. **Double Down on {lead_cat} Leader ({top_name})**: It commands **₹{top_val:,.0f}** ({top_share:.1f}% of total `{lead_metric}`). Maintain aggressive stock levels and primary marketing focus here.\n"
+            f"2. **Audit Underperforming Segments ({bottom_name})**: Contributes only **₹{bottom_val:,.0f}**. Assess whether low returns are caused by margin leakage, uncompetitive pricing, or supply bottlenecks.\n"
+            f"3. **Bundle & Cross-Sell**: Pair high-velocity items from **{top_name}** with complementary accessories to elevate average transaction value.\n"
+            f"4. **Re-engagement Campaign**: Build targeted promotional discounts for secondary segments to stimulate conversion.\n\n"
+            f"*(Rolling 1-minute API quota resets automatically in ~30–45 seconds for full open-ended conversational reasoning.)*"
+        )
+
+    return (
+        "⏳ **Rate limit reached (Free tier: 5 requests/min)**.\n\n"
+        "Please wait roughly 30–45 seconds for the Google rolling quota to reset, then ask your question again."
+    )
+
+
 def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, quality_info: dict) -> str:
     """
     Generates a conversational response from Gemini grounded in the loaded dataset context.
+    Includes automated failover for HTTP 429 quota exceptions.
     """
     if df is None or df.empty:
         return "No dataset is currently active. Please upload a dataset or restore sample data to start asking questions."
 
     api_key = _get_api_key()
+    last_user_msg = messages[-1]["content"] if messages else ""
 
     # Offline / Heuristic Fallback Engine
     if not api_key or not HAS_GENAI:
-        last_user_msg = messages[-1]["content"].lower() if messages else ""
-        
+        msg_lower = last_user_msg.lower()
         num_cols = schema_info.get("numeric_columns", [])
-        matched_num = [c for c in num_cols if c.lower() in last_user_msg]
-        
-        if "rows" in last_user_msg or "size" in last_user_msg or "records" in last_user_msg:
+        matched_num = [c for c in num_cols if c.lower() in msg_lower]
+
+        if "rows" in msg_lower or "size" in msg_lower or "records" in msg_lower:
             return f"The active dataset has **{len(df):,} rows** and **{len(df.columns)} columns**."
-        if "columns" in last_user_msg or "features" in last_user_msg:
+        if "columns" in msg_lower or "features" in msg_lower:
             return f"The dataset contains the following columns: `{', '.join(df.columns)}`."
-        if matched_num and any(w in last_user_msg for w in ["total", "sum"]):
+        if matched_num and any(w in msg_lower for w in ["total", "sum"]):
             col = matched_num[0]
             val = pd.to_numeric(df[col], errors="coerce").sum()
             return f"The total sum of **{col}** is **{val:,.2f}**."
-        if matched_num and any(w in last_user_msg for w in ["average", "mean", "avg"]):
+        if matched_num and any(w in msg_lower for w in ["average", "mean", "avg"]):
             col = matched_num[0]
             val = pd.to_numeric(df[col], errors="coerce").mean()
             return f"The average of **{col}** is **{val:,.2f}**."
@@ -136,7 +182,7 @@ SAMPLE DATA ROWS:
 INSTRUCTIONS:
 1. Answer the user's questions clearly, accurately, and strategically based directly on the provided dataset context.
 2. If asked "How to improve sales", "Why are profits low", or similar business strategy questions:
-   - Cite specific categories, products, or regions present in the data (e.g., Electronics, Furniture, etc.).
+   - Cite specific categories, products, or regions present in the data (e.g., Electronics, Furniture, Technology).
    - Provide 3-4 concrete, numbered tactical steps (such as bundling, targeted promotions, margin adjustments, inventory rebalancing).
 3. Use clean markdown formatting (**bolding**, bullet points) for readability.
 """
@@ -145,8 +191,8 @@ INSTRUCTIONS:
         for msg in messages[:-1]:
             role = "User" if msg["role"] == "user" else "Assistant"
             conversation_history += f"{role}: {msg['content']}\n"
-        
-        conversation_history += f"User: {messages[-1]['content']}\nAssistant:"
+
+        conversation_history += f"User: {last_user_msg}\nAssistant:"
 
         active_model_name = _get_supported_model_name(api_key)
         model = genai.GenerativeModel(active_model_name)
@@ -157,4 +203,8 @@ INSTRUCTIONS:
         return "I could not generate a response. Please rephrase your question."
 
     except Exception as e:
-        return f"Unable to generate response: {str(e)}"
+        err_str = str(e)
+        # Graceful handler for Free Tier 429 quota exhaustion
+        if "429" in err_str or "quota" in err_str.lower():
+            return _build_rate_limit_fallback(df, schema_info, last_user_msg)
+        return f"Unable to generate response: {err_str}"
