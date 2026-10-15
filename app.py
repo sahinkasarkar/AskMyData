@@ -2,19 +2,27 @@
 app.py
 AskMyData — Pixel-Perfect, Fully-Responsive Analytics Dashboard
 Features:
+- Dedicated "AI Chatbot" page for open-ended dataset questions & business strategy
 - Dual exports: Instant CSV data slice & Print-Ready HTML Executive Brief
 - Conversational follow-up memory across sequential user questions
 - Smart business dimension detection (excludes Order_ID, UUIDs, codes from AI insights)
-- On-demand user execution (no auto-analysis on page load)
+- Safe, crash-proof API key discovery across .env, os.environ, and Streamlit secrets
 - Dynamic schema-aware filters, inline dataset cancellation, fluid typography
 - Universal bottom copyright footer
 """
+import os
+import io
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
-import os
-import io
+
+# Load local environment variables immediately
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from modules.data_loader import load_dataset
 from modules.profiler import profile_dataset
@@ -39,7 +47,7 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    @import url('[https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap](https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap)');
 
     *, *::before, *::after {
         box-sizing: border-box;
@@ -183,7 +191,6 @@ st.markdown("""
         box-shadow: 0 2px 5px rgba(124, 58, 237, 0.3) !important;
     }
 
-    /* Hide redundant native upload file chip completely */
     section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"],
     section[data-testid="stSidebar"] [data-testid="stFileUploaderFileData"],
     section[data-testid="stSidebar"] div[data-testid="stFileUploader"] ul {
@@ -459,7 +466,6 @@ st.markdown("""
         padding: 7px 12px !important;
     }
 
-    /* Small download buttons */
     div[data-testid="stDownloadButton"] > button {
         background: #F8FAFC !important;
         color: #2563EB !important;
@@ -563,7 +569,6 @@ def generate_dynamic_insights(df, query, result, quality):
             {"title": "Awaiting Dataset", "desc": "Upload a CSV/Excel file or restore sample data to see automated insights.", "type": "neutral"}
         ]
 
-    # Insight 1: Analysis Question Specific Finding
     if isinstance(result, pd.DataFrame) and not result.empty and len(result.columns) >= 2:
         grp_col = result.columns[0]
         val_col = result.columns[1]
@@ -594,7 +599,6 @@ def generate_dynamic_insights(df, query, result, quality):
                 "type": "positive"
             })
 
-    # Insight 2: Segment Variance (Using Business Dimensions only)
     meaningful_dims = get_meaningful_categorical_columns(df)
     if meaningful_dims:
         sample_cat = meaningful_dims[0]
@@ -608,7 +612,6 @@ def generate_dynamic_insights(df, query, result, quality):
                 "type": "purple"
             })
 
-    # Insight 3: Data Quality & Hygiene
     missing_cells = quality.get("metrics", {}).get("total_missing_cells", 0)
     outlier_count = sum(quality.get("metrics", {}).get("columns_with_outliers", {}).values())
     
@@ -648,7 +651,6 @@ def generate_dynamic_recommendations(df, query, result, quality):
             "Include both metric columns (Sales, Profit) and segment columns (Region, Category)."
         ]
 
-    # Recommendation 1: Response to Query or Top Entities
     if isinstance(result, pd.DataFrame) and not result.empty and len(result.columns) >= 2:
         grp_col = result.columns[0]
         top_name = str(result.iloc[0][grp_col])
@@ -663,12 +665,10 @@ def generate_dynamic_recommendations(df, query, result, quality):
         else:
             recs.append("Segment metrics across regional or category dimensions to identify primary revenue drivers.")
 
-    # Recommendation 2: Inventory / Campaign Optimization on Business Dimensions
     meaningful_dims = get_meaningful_categorical_columns(df)
     if meaningful_dims:
         recs.append(f"Create prioritized promotional cohorts segmented by <b>{meaningful_dims[0]}</b> to lift repeat conversion rates.")
 
-    # Recommendation 3: Data Quality Action Item
     missing_cells = quality.get("metrics", {}).get("total_missing_cells", 0)
     if missing_cells > 0:
         recs.append(f"Standardize ingestion pipelines to clean <b>{missing_cells} records</b> missing key attributes.")
@@ -701,7 +701,7 @@ def build_executive_html_report(file_name, query, answer_headline, result_df, re
         <meta charset="utf-8">
         <title>Executive Brief - AskMyData</title>
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap');
+            @import url('[https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap](https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap)');
             body {{
                 font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
                 margin: 40px auto;
@@ -815,6 +815,11 @@ if "last_plan" not in st.session_state:
 if "nav_page" not in st.session_state:
     st.session_state.nav_page = "Home"
 
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {"role": "assistant", "content": "👋 Hi! I'm your AI Data Analyst. Ask me anything about your uploaded dataset, trends, metrics, anomalies, or strategies to improve performance."}
+    ]
+
 
 # -----------------------------------------------------------------------------
 # SIDEBAR NAVIGATION & DATASET CONTROLLER
@@ -835,6 +840,7 @@ with st.sidebar:
 
     nav_items = [
         ("Home", "🏠 Home"),
+        ("AI Chatbot", "💬 AI Chatbot"),
         ("Analysis", "📊 Analysis"),
         ("AI Insights", "💡 AI Insights"),
         ("Data Quality", "🛡️ Data Quality"),
@@ -1124,7 +1130,6 @@ if st.session_state.nav_page == "Home":
     if user_triggered:
         st.session_state.current_query = input_query
 
-        # Extract conversational follow-up context from the preceding run
         prev_context = None
         if st.session_state.last_plan and st.session_state.last_result is not None:
             last_top = None
@@ -1208,7 +1213,6 @@ if st.session_state.nav_page == "Home":
                     )
             with hdr_rep:
                 if isinstance(active_res, pd.DataFrame) and not active_res.empty:
-                    # Pre-calculate recommendations for report injection
                     report_recs = generate_dynamic_recommendations(df, st.session_state.current_query, active_res, quality)
                     html_report = build_executive_html_report(
                         file_name=file_name,
@@ -1329,6 +1333,67 @@ if st.session_state.nav_page == "Home":
 
 
 # -----------------------------------------------------------------------------
+# PAGE ROUTING: AI CHATBOT
+# -----------------------------------------------------------------------------
+elif st.session_state.nav_page == "AI Chatbot":
+    from modules.chatbot_engine import generate_chat_response
+
+    st.markdown("""
+        <div class="hero-card">
+            <div class="hello-pill">💬 Conversational AI</div>
+            <div class="hero-headline">Chat with your <span>Data</span></div>
+            <div class="hero-tagline">Ask free-form questions, explore anomalies, or request business growth advice.</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    if df is None or df.empty:
+        st.warning("⚠️ No dataset is active. Please upload a dataset from the sidebar to chat with it.")
+    else:
+        q_cols = st.columns(3)
+        with q_cols[0]:
+            if st.button("📊 Summarize this dataset", key="chat_pill_1", use_container_width=True):
+                st.session_state.chat_messages.append({"role": "user", "content": "Can you give me a summary of this dataset and its primary patterns?"})
+                with st.spinner("Analyzing..."):
+                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+                st.rerun()
+        with q_cols[1]:
+            if st.button("🚨 What anomalies exist?", key="chat_pill_2", use_container_width=True):
+                st.session_state.chat_messages.append({"role": "user", "content": "What anomalies, outliers, or missing values should I be aware of?"})
+                with st.spinner("Analyzing..."):
+                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+                st.rerun()
+        with q_cols[2]:
+            if st.button("💡 How can I improve sales?", key="chat_pill_3", use_container_width=True):
+                st.session_state.chat_messages.append({"role": "user", "content": "Based on this data, what concrete steps can I take to improve sales and profit?"})
+                with st.spinner("Analyzing..."):
+                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+                st.rerun()
+
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+        chat_container = st.container()
+        with chat_container:
+            for message in st.session_state.chat_messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        if user_prompt := st.chat_input("Ask a question about your dataset (e.g. 'How can I improve sales?', 'Why is profit low in West?')..."):
+            st.session_state.chat_messages.append({"role": "user", "content": user_prompt})
+            with st.chat_message("user"):
+                st.markdown(user_prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing dataset patterns..."):
+                    response = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
+                    st.markdown(response)
+
+            st.session_state.chat_messages.append({"role": "assistant", "content": response})
+
+
+# -----------------------------------------------------------------------------
 # PAGE ROUTING: ANALYSIS
 # -----------------------------------------------------------------------------
 elif st.session_state.nav_page == "Analysis":
@@ -1360,11 +1425,14 @@ elif st.session_state.nav_page == "Analysis":
             if cat_cols:
                 cat_summary = []
                 for c in cat_cols:
+                    u_count = df[c].nunique()
+                    top_m = str(df[c].mode().iloc[0]) if not df[c].empty else "-"
+                    top_f = int(df[c].value_counts().iloc[0]) if not df[c].empty else 0
                     cat_summary.append({
                         "Column": c,
-                        "Unique Values": df[c].nunique(),
-                        "Top Value": str(df[c].mode().iloc[0]) if not df[c].empty else "-",
-                        "Top Freq": int(df[c].value_counts().iloc[0]) if not df[c].empty else 0
+                        "Unique Values": u_count,
+                        "Top Value": top_m,
+                        "Top Freq": top_f
                     })
                 render_table(pd.DataFrame(cat_summary))
             else:
@@ -1474,7 +1542,7 @@ elif st.session_state.nav_page == "Data Preview":
 
 
 # -----------------------------------------------------------------------------
-# PAGE ROUTING: HISTORY (GLOBALLY UNIQUE WIDGET KEYS)
+# PAGE ROUTING: HISTORY (SAFE STRING FORMATTING)
 # -----------------------------------------------------------------------------
 elif st.session_state.nav_page == "History":
     st.subheader("🕘 Session Query History")
@@ -1486,16 +1554,19 @@ elif st.session_state.nav_page == "History":
         for idx, item in enumerate(st.session_state.history):
             h1, h2 = st.columns([8.2, 1.8], gap="small")
             with h1:
-                st.markdown(
-                    f"<div class='white-card' style='padding:12px 14px; margin-bottom:8px;'>"
-                    f"<b>Question:</b> {item['query']} "
-                    f"<span style='float:right; color:#94A3B8; font-size:0.78rem;'>{item['time']}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True
+                query_val = str(item.get("query", ""))
+                time_val = str(item.get("time", ""))
+                history_card_html = (
+                    "<div class='white-card' style='padding:12px 14px; margin-bottom:8px;'>"
+                    + f"<b>Question:</b> {query_val} "
+                    + f"<span style='float:right; color:#94A3B8; font-size:0.78rem;'>{time_val}</span>"
+                    + "</div>"
                 )
+                st.markdown(history_card_html, unsafe_allow_html=True)
             with h2:
-                if st.button("Re-run", key=f"hist_btn_{idx}_{hash(item['query'])}", use_container_width=True):
-                    st.session_state.current_query = item['query']
+                btn_unique_key = f"hist_btn_{idx}_{abs(hash(item.get('query', '')))}"
+                if st.button("Re-run", key=btn_unique_key, use_container_width=True):
+                    st.session_state.current_query = item.get("query", "")
                     st.session_state.nav_page = "Home"
                     st.session_state.last_result = None
                     st.rerun()
