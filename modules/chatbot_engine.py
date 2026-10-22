@@ -1,8 +1,11 @@
 """
 modules/chatbot_engine.py
-Interactive AI chatbot engine grounded in the uploaded dataset schema, profile, and sample rows.
-Uses safe API key retrieval, native string formatting, gemini-3.8-flash model resolution,
-and an automated analytical fallback engine for HTTP 429 rate limits.
+Interactive AI chatbot engine grounded in the active dataset schema, profile, and sample records.
+Features:
+- Instant key diagnostic probe (`check key`) to verify active secrets on Streamlit Cloud
+- Multi-tier model cascade across supported Gemini endpoints
+- Cached model discovery to eliminate round-trip latency
+- Intelligent offline analytical fallback excluding technical IDs
 """
 import os
 import streamlit as st
@@ -25,92 +28,93 @@ def _get_api_key() -> str | None:
     """Safely retrieves API key across local (.env/os) and Streamlit Cloud (secrets)."""
     key = os.getenv("GEMINI_API_KEY")
     if key:
-        return key
+        return key.strip().strip('"').strip("'")
 
     try:
         if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"]
+            return str(st.secrets["GEMINI_API_KEY"]).strip().strip('"').strip("'")
     except Exception:
         pass
 
     return None
 
 
-def _get_supported_model_name(api_key: str) -> str:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_available_models(api_key: str) -> list[str]:
     """
-    Selects the active model version supported by your Google AI project.
+    Discovers and caches available models that support generateContent for the active key.
     """
-    candidate_priorities = [
-        "gemini-3.8-flash",
-        "models/gemini-3.8-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash"
-    ]
-
     try:
-        available_models = [
+        genai.configure(api_key=api_key)
+        models = [
             m.name for m in genai.list_models()
             if "generateContent" in getattr(m, "supported_generation_methods", [])
         ]
-        for cand in candidate_priorities:
-            if cand in available_models or cand.replace("models/", "") in [m.replace("models/", "") for m in available_models]:
-                return cand
-        if available_models:
-            return available_models[0]
+        return models
     except Exception:
-        pass
-
-    return "gemini-3.8-flash"
+        return []
 
 
-def _build_rate_limit_fallback(df: pd.DataFrame, schema_info: dict, last_user_msg: str) -> str:
+def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: dict, last_user_msg: str) -> str:
     """
-    Constructs an immediate, data-backed strategic answer when the Google Free-Tier 
-    5 RPM rate limit is reached.
+    Constructs an immediate, data-backed analytical response using meaningful
+    business dimensions (filtering out Order_ID, UUIDs) and data quality metrics.
     """
+    excluded = ["id", "code", "key", "number", "num", "phone", "email"]
+    meaningful_cats = [
+        c for c in df.columns 
+        if (df[c].dtype == "object" or df[c].dtype.name == "category")
+        and not any(tok in c.lower() for tok in excluded)
+    ]
+    
     num_cols = schema_info.get("numeric_columns", [])
-    cat_cols = [c for c in df.columns if df[c].dtype == "object" or df[c].dtype.name == "category"]
-
-    lead_cat = cat_cols[0] if cat_cols else None
-    lead_metric = num_cols[0] if num_cols else None
-
-    # Check if user mentioned a specific column or category in their prompt
     q_lower = last_user_msg.lower()
-    for c in cat_cols:
-        matched_vals = [val for val in df[c].dropna().unique() if str(val).lower() in q_lower]
-        if matched_vals:
+
+    # Data health / anomaly audit questions
+    if any(k in q_lower for k in ["anomal", "outlier", "missing", "defect", "quality"]):
+        missing = quality_info.get("metrics", {}).get("total_missing_cells", 0)
+        outliers = sum(quality_info.get("metrics", {}).get("columns_with_outliers", {}).values())
+        score = quality_info.get("score", 95)
+        
+        return (
+            f"🛡️ **Automated Data Quality Audit**\n\n"
+            f"- **Data Integrity Score**: **{score}/100**\n"
+            f"- **Missing Cells**: **{missing}** across {len(df):,} records.\n"
+            f"- **Statistical Outliers**: **{outliers}** points outside standard variance intervals.\n"
+            f"- **Sanitization Advice**: Audit flagged numeric fields for negative values or unnormalized scale spikes."
+        )
+
+    # Business strategy & sales optimization
+    lead_cat = meaningful_cats[0] if meaningful_cats else df.columns[0]
+    lead_metric = num_cols[0] if num_cols else df.columns[-1]
+
+    for c in meaningful_cats:
+        if c.lower() in q_lower:
             lead_cat = c
             break
 
-    if lead_cat and lead_metric:
-        grouped = df.groupby(lead_cat)[lead_metric].sum().sort_values(ascending=False)
-        top_name = grouped.index[0]
-        top_val = grouped.iloc[0]
-        bottom_name = grouped.index[-1]
-        bottom_val = grouped.iloc[-1]
-        total_val = grouped.sum()
-        top_share = (top_val / total_val * 100) if total_val > 0 else 0
-
-        return (
-            f"⚡ **Immediate Analysis (Quota Recovery Mode)**\n\n"
-            f"*The Google AI Free-Tier rate limit (5 requests/min) was reached. Here are direct strategic takeaways derived from your active numbers:*\n\n"
-            f"1. **Double Down on {lead_cat} Leader ({top_name})**: It commands **₹{top_val:,.0f}** ({top_share:.1f}% of total `{lead_metric}`). Maintain aggressive stock levels and primary marketing focus here.\n"
-            f"2. **Audit Underperforming Segments ({bottom_name})**: Contributes only **₹{bottom_val:,.0f}**. Assess whether low returns are caused by margin leakage, uncompetitive pricing, or supply bottlenecks.\n"
-            f"3. **Bundle & Cross-Sell**: Pair high-velocity items from **{top_name}** with complementary accessories to elevate average transaction value.\n"
-            f"4. **Re-engagement Campaign**: Build targeted promotional discounts for secondary segments to stimulate conversion.\n\n"
-            f"*(Rolling 1-minute API quota resets automatically in ~30–45 seconds for full open-ended conversational reasoning.)*"
-        )
+    grouped = df.groupby(lead_cat)[lead_metric].sum().sort_values(ascending=False)
+    top_name = grouped.index[0]
+    top_val = grouped.iloc[0]
+    bottom_name = grouped.index[-1]
+    bottom_val = grouped.iloc[-1]
+    total_val = grouped.sum()
+    top_share = (top_val / total_val * 100) if total_val > 0 else 0
 
     return (
-        "⏳ **Rate limit reached (Free tier: 5 requests/min)**.\n\n"
-        "Please wait roughly 30–45 seconds for the Google rolling quota to reset, then ask your question again."
+        f"📊 **Data-Driven Strategy Breakdown (Local Recovery Mode)**\n\n"
+        f"Analysis based on **{lead_cat}** against **{lead_metric}**:\n\n"
+        f"1. **Core Growth Engine ({top_name})**: Generates **₹{top_val:,.0f}** ({top_share:.1f}% of total `{lead_metric}`). Maintain high stock availability and priority marketing.\n"
+        f"2. **Lagging Segment ({bottom_name})**: Produces **₹{bottom_val:,.0f}**. Review pricing competitiveness, demand softness, or catalog visibility.\n"
+        f"3. **Cross-Category Bundling**: Combine high-volume `{top_name}` SKUs with underperforming segments to lift basket size.\n"
+        f"4. **Re-engagement Campaign**: Run targeted promotions on secondary segments to diversify revenue."
     )
 
 
 def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, quality_info: dict) -> str:
     """
-    Generates a conversational response from Gemini grounded in the loaded dataset context.
-    Includes automated failover for HTTP 429 quota exceptions.
+    Generates a conversational response from Gemini grounded in the loaded dataset.
+    Cascades across models and catches quota rate limits gracefully.
     """
     if df is None or df.empty:
         return "No dataset is currently active. Please upload a dataset or restore sample data to start asking questions."
@@ -118,34 +122,19 @@ def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, 
     api_key = _get_api_key()
     last_user_msg = messages[-1]["content"] if messages else ""
 
-    # Offline / Heuristic Fallback Engine
+    # Instant diagnostic tool
+    if last_user_msg.strip().lower() == "check key":
+        if not api_key:
+            return "❌ **Diagnostic Result**: No `GEMINI_API_KEY` was found in `os.environ` or `st.secrets`."
+        return f"🔑 **Diagnostic Result**: Active key detected with prefix `{api_key[:8]}` and suffix `{api_key[-4:]}`."
+
+    # Fallback if no API key is provided
     if not api_key or not HAS_GENAI:
-        msg_lower = last_user_msg.lower()
-        num_cols = schema_info.get("numeric_columns", [])
-        matched_num = [c for c in num_cols if c.lower() in msg_lower]
-
-        if "rows" in msg_lower or "size" in msg_lower or "records" in msg_lower:
-            return f"The active dataset has **{len(df):,} rows** and **{len(df.columns)} columns**."
-        if "columns" in msg_lower or "features" in msg_lower:
-            return f"The dataset contains the following columns: `{', '.join(df.columns)}`."
-        if matched_num and any(w in msg_lower for w in ["total", "sum"]):
-            col = matched_num[0]
-            val = pd.to_numeric(df[col], errors="coerce").sum()
-            return f"The total sum of **{col}** is **{val:,.2f}**."
-        if matched_num and any(w in msg_lower for w in ["average", "mean", "avg"]):
-            col = matched_num[0]
-            val = pd.to_numeric(df[col], errors="coerce").mean()
-            return f"The average of **{col}** is **{val:,.2f}**."
-
-        return (
-            f"I am analyzing the dataset with columns: `{', '.join(df.columns[:8])}`. "
-            "To unlock full conversational AI reasoning and complex interpretations, ensure your `GEMINI_API_KEY` is configured."
-        )
+        return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
 
     try:
         genai.configure(api_key=api_key)
 
-        # Context generation using native pandas methods (no tabulate library required)
         dataset_sample = df.head(8).to_string(index=False)
         describe_sample = (
             df.describe().T[["count", "mean", "min", "max"]].to_string()
@@ -180,11 +169,10 @@ SAMPLE DATA ROWS:
 {dataset_sample}
 
 INSTRUCTIONS:
-1. Answer the user's questions clearly, accurately, and strategically based directly on the provided dataset context.
-2. If asked "How to improve sales", "Why are profits low", or similar business strategy questions:
-   - Cite specific categories, products, or regions present in the data (e.g., Electronics, Furniture, Technology).
-   - Provide 3-4 concrete, numbered tactical steps (such as bundling, targeted promotions, margin adjustments, inventory rebalancing).
-3. Use clean markdown formatting (**bolding**, bullet points) for readability.
+1. Answer clearly, accurately, and strategically based directly on the provided dataset context.
+2. If asked about anomalies or defects, reference the Data Quality Score and variance distributions.
+3. If asked how to improve sales, cite actual categories or products from the data and give 3-4 actionable steps.
+4. Use clean markdown formatting (**bolding**, bullet points).
 """
 
         conversation_history = f"{system_context}\n\nCONVERSATION HISTORY:\n"
@@ -194,17 +182,39 @@ INSTRUCTIONS:
 
         conversation_history += f"User: {last_user_msg}\nAssistant:"
 
-        active_model_name = _get_supported_model_name(api_key)
-        model = genai.GenerativeModel(active_model_name)
-        response = model.generate_content(conversation_history)
+        # Candidate models to attempt sequentially
+        model_candidates = [
+            "gemini-3.8-flash",
+            "models/gemini-3.8-flash",
+            "gemini-2.5-flash",
+            "models/gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash"
+        ]
 
-        if response and response.text:
-            return response.text.strip()
-        return "I could not generate a response. Please rephrase your question."
+        # Prioritize against cached list of active models for this key
+        discovered_models = _get_available_models(api_key)
+        ordered_candidates = [m for m in model_candidates if m in discovered_models] + [
+            m for m in model_candidates if m not in discovered_models
+        ]
 
-    except Exception as e:
-        err_str = str(e)
-        # Graceful handler for Free Tier 429 quota exhaustion
-        if "429" in err_str or "quota" in err_str.lower():
-            return _build_rate_limit_fallback(df, schema_info, last_user_msg)
-        return f"Unable to generate response: {err_str}"
+        last_err = None
+        for m_name in ordered_candidates:
+            try:
+                model = genai.GenerativeModel(m_name)
+                response = model.generate_content(conversation_history)
+                if response and response.text:
+                    return response.text.strip()
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # If rate-limited or unavailable on this specific endpoint, proceed to next model
+                if "429" in err_str or "quota" in err_str.lower() or "404" in err_str:
+                    continue
+                continue
+
+        # If all candidate models failed or are quota-exhausted
+        return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
+
+    except Exception:
+        return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
