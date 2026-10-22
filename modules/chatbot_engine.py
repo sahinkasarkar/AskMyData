@@ -3,6 +3,7 @@ modules/chatbot_engine.py
 Interactive AI chatbot engine grounded in the active dataset schema, profile, and sample records.
 Features:
 - Instant key diagnostic probe (`check key`) to verify active secrets on Streamlit Cloud
+- Direct error reporting to diagnose API failures on newly generated keys
 - Multi-tier model cascade across supported Gemini endpoints
 - Cached model discovery to eliminate round-trip latency
 - Intelligent offline analytical fallback excluding technical IDs
@@ -114,7 +115,7 @@ def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: d
 def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, quality_info: dict) -> str:
     """
     Generates a conversational response from Gemini grounded in the loaded dataset.
-    Cascades across models and catches quota rate limits gracefully.
+    Displays detailed error messages if API calls fail to assist in setup debugging.
     """
     if df is None or df.empty:
         return "No dataset is currently active. Please upload a dataset or restore sample data to start asking questions."
@@ -192,7 +193,6 @@ INSTRUCTIONS:
             "gemini-1.5-flash"
         ]
 
-        # Prioritize against cached list of active models for this key
         discovered_models = _get_available_models(api_key)
         ordered_candidates = [m for m in model_candidates if m in discovered_models] + [
             m for m in model_candidates if m not in discovered_models
@@ -207,14 +207,16 @@ INSTRUCTIONS:
                     return response.text.strip()
             except Exception as e:
                 last_err = e
-                err_str = str(e)
-                # If rate-limited or unavailable on this specific endpoint, proceed to next model
-                if "429" in err_str or "quota" in err_str.lower() or "404" in err_str:
-                    continue
                 continue
 
-        # If all candidate models failed or are quota-exhausted
+        # If all candidate models fail, return the exact Google error for diagnosis
+        if last_err is not None:
+            return (
+                f"⚠️ **Gemini API Error Detail**: `{str(last_err)}`\n\n"
+                f"*Candidate models attempted:* `{', '.join(ordered_candidates[:4])}`"
+            )
+
         return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
 
-    except Exception:
-        return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
+    except Exception as e:
+        return f"⚠️ **Chatbot Execution Error**: `{str(e)}`"
