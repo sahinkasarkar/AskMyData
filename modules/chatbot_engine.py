@@ -2,11 +2,9 @@
 modules/chatbot_engine.py
 Interactive AI chatbot engine grounded in the active dataset schema, profile, and sample records.
 Features:
+- Dynamic model discovery via genai.list_models() to prevent 404 version mismatches
 - Instant key diagnostic probe (`check key`) to verify active secrets on Streamlit Cloud
-- Direct error reporting to diagnose API failures on newly generated keys
-- Multi-tier model cascade across supported Gemini endpoints
-- Cached model discovery to eliminate round-trip latency
-- Intelligent offline analytical fallback excluding technical IDs
+- Intelligent fallback analysis when all models are quota-limited
 """
 import os
 import streamlit as st
@@ -40,20 +38,37 @@ def _get_api_key() -> str | None:
     return None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def _get_available_models(api_key: str) -> list[str]:
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_usable_models(api_key: str) -> list[str]:
     """
-    Discovers and caches available models that support generateContent for the active key.
+    Queries Google API to discover exact model names supported for generateContent.
+    Caches the result for 30 minutes to eliminate latency.
     """
+    usable = []
     try:
         genai.configure(api_key=api_key)
-        models = [
-            m.name for m in genai.list_models()
-            if "generateContent" in getattr(m, "supported_generation_methods", [])
-        ]
-        return models
+        for m in genai.list_models():
+            if "generateContent" in getattr(m, "supported_generation_methods", []):
+                # Clean 'models/' prefix to avoid 404 endpoint mapping errors
+                clean_name = m.name.replace("models/", "")
+                usable.append(clean_name)
     except Exception:
-        return []
+        pass
+
+    # Preferred priority order if available
+    preferred_order = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash"
+    ]
+    sorted_models = [m for m in preferred_order if m in usable]
+    for m in usable:
+        if m not in sorted_models:
+            sorted_models.append(m)
+
+    return sorted_models if sorted_models else ["gemini-2.0-flash", "gemini-2.5-flash"]
 
 
 def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: dict, last_user_msg: str) -> str:
@@ -71,7 +86,6 @@ def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: d
     num_cols = schema_info.get("numeric_columns", [])
     q_lower = last_user_msg.lower()
 
-    # Data health / anomaly audit questions
     if any(k in q_lower for k in ["anomal", "outlier", "missing", "defect", "quality"]):
         missing = quality_info.get("metrics", {}).get("total_missing_cells", 0)
         outliers = sum(quality_info.get("metrics", {}).get("columns_with_outliers", {}).values())
@@ -85,7 +99,6 @@ def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: d
             f"- **Sanitization Advice**: Audit flagged numeric fields for negative values or unnormalized scale spikes."
         )
 
-    # Business strategy & sales optimization
     lead_cat = meaningful_cats[0] if meaningful_cats else df.columns[0]
     lead_metric = num_cols[0] if num_cols else df.columns[-1]
 
@@ -115,7 +128,6 @@ def _build_offline_analysis(df: pd.DataFrame, schema_info: dict, quality_info: d
 def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, quality_info: dict) -> str:
     """
     Generates a conversational response from Gemini grounded in the loaded dataset.
-    Displays detailed error messages if API calls fail to assist in setup debugging.
     """
     if df is None or df.empty:
         return "No dataset is currently active. Please upload a dataset or restore sample data to start asking questions."
@@ -127,9 +139,12 @@ def generate_chat_response(messages: list, df: pd.DataFrame, schema_info: dict, 
     if last_user_msg.strip().lower() == "check key":
         if not api_key:
             return "❌ **Diagnostic Result**: No `GEMINI_API_KEY` was found in `os.environ` or `st.secrets`."
-        return f"🔑 **Diagnostic Result**: Active key detected with prefix `{api_key[:8]}` and suffix `{api_key[-4:]}`."
+        models_available = _get_usable_models(api_key)
+        return (
+            f"🔑 **Diagnostic Result**: Active key detected with prefix `{api_key[:8]}` and suffix `{api_key[-4:]}`.\n\n"
+            f"**Supported Models Found**: `{', '.join(models_available[:5])}`"
+        )
 
-    # Fallback if no API key is provided
     if not api_key or not HAS_GENAI:
         return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
 
@@ -183,23 +198,11 @@ INSTRUCTIONS:
 
         conversation_history += f"User: {last_user_msg}\nAssistant:"
 
-        # Candidate models to attempt sequentially
-        model_candidates = [
-            "gemini-3.8-flash",
-            "models/gemini-3.8-flash",
-            "gemini-2.5-flash",
-            "models/gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash"
-        ]
-
-        discovered_models = _get_available_models(api_key)
-        ordered_candidates = [m for m in model_candidates if m in discovered_models] + [
-            m for m in model_candidates if m not in discovered_models
-        ]
+        # Get the actual model strings enabled on this account
+        candidate_models = _get_usable_models(api_key)
 
         last_err = None
-        for m_name in ordered_candidates:
+        for m_name in candidate_models:
             try:
                 model = genai.GenerativeModel(m_name)
                 response = model.generate_content(conversation_history)
@@ -209,12 +212,12 @@ INSTRUCTIONS:
                 last_err = e
                 continue
 
-        # If all candidate models fail, return the exact Google error for diagnosis
+        # If all discovered models are rate limited or fail
         if last_err is not None:
-            return (
-                f"⚠️ **Gemini API Error Detail**: `{str(last_err)}`\n\n"
-                f"*Candidate models attempted:* `{', '.join(ordered_candidates[:4])}`"
-            )
+            err_str = str(last_err)
+            if "429" in err_str or "quota" in err_str.lower():
+                return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
+            return f"⚠️ **Gemini API Error Detail**: `{err_str}`\n\n*Models queried:* `{candidate_models[:3]}`"
 
         return _build_offline_analysis(df, schema_info, quality_info, last_user_msg)
 
