@@ -1,125 +1,108 @@
 """
 modules/analysis_engine.py
-Executes structured JSON query plans deterministically on Pandas DataFrames.
-Features automatic type coercion, filter application, temporal binning, and error handling.
+Deterministically executes generated analytical plans against active Pandas DataFrames.
+Strictly respects sort_ascending and limit parameters.
 """
 import pandas as pd
 import numpy as np
 
 
-def _clean_numeric_series(series: pd.Series) -> pd.Series:
-    """Coerces strings with currency symbols or commas into clean numeric floats."""
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_numeric(series, errors="coerce")
-    
-    cleaned = (
-        series.astype(str)
-        .str.replace(r"[₹$,\s]", "", regex=True)
-        .str.replace(r"[^\d.-]", "", regex=True)
-    )
-    return pd.to_numeric(cleaned, errors="coerce")
-
-
-def execute_plan(df: pd.DataFrame, plan: dict) -> tuple[pd.DataFrame | float | None, str | None]:
+def execute_plan(df: pd.DataFrame, plan: dict) -> tuple[pd.DataFrame | float | int | None, str | None]:
     """
-    Executes a structured query plan on a DataFrame.
-    Returns: (result_data, error_message_or_None)
+    Executes a structured analytical plan on the active DataFrame.
+    Returns: (result_data, error_string_or_None)
     """
     if df is None or df.empty:
-        return None, "Dataset is empty or not loaded."
-    if not plan:
-        return None, "Invalid or empty execution plan."
+        return None, "Dataset is empty."
+
+    if not plan or not isinstance(plan, dict):
+        return None, "Invalid execution plan."
+
+    op = plan.get("operation", "groupby")
+    grp = plan.get("group_column")
+    val = plan.get("value_column")
+    agg_func = plan.get("agg_func", "sum").lower()
+    limit = plan.get("limit")
+    sort_asc = plan.get("sort_ascending", False)
+    cond = plan.get("filter_condition")
 
     try:
-        working_df = df.copy()
-        operation = plan.get("operation", "groupby")
-        group_col = plan.get("group_column")
-        val_col = plan.get("value_column")
-        agg_func = plan.get("agg_func", "sum")
-        sort_asc = plan.get("sort_ascending", False)
-        limit = plan.get("limit")
-        plan_filters = plan.get("filters", [])
+        data = df.copy()
 
-        # 0. Apply query plan level filters (e.g. from conversational context)
-        if plan_filters and isinstance(plan_filters, list):
-            for f in plan_filters:
-                f_col = f.get("column")
-                f_val = f.get("value")
-                f_op = f.get("operator", "==")
-                if f_col and f_col in working_df.columns and f_val is not None:
-                    if f_op == "==":
-                        working_df = working_df[working_df[f_col].astype(str) == str(f_val)]
-                    elif f_op == "!=":
-                        working_df = working_df[working_df[f_col].astype(str) != str(f_val)]
+        # 1. Apply preliminary filter if specified
+        if cond and isinstance(cond, dict):
+            c_col = cond.get("column")
+            c_val = cond.get("value")
+            if c_col in data.columns and c_val is not None:
+                data = data[data[c_col].astype(str).str.lower() == str(c_val).lower()]
+                if data.empty:
+                    return None, f"No records found where {c_col} matches '{c_val}'."
 
-        # Fallback column selection if planner missed matching
-        if not val_col or val_col not in working_df.columns:
-            num_cols = [c for c in working_df.columns if pd.api.types.is_numeric_dtype(working_df[c])]
-            val_col = num_cols[0] if num_cols else working_df.columns[-1]
+        # 2. Filter Operation
+        if op == "filter":
+            return data.head(limit or 25), None
 
-        # Clean the value column to guarantee valid numeric arithmetic
-        working_df[val_col] = _clean_numeric_series(working_df[val_col])
-
-        # 1. SCALAR AGGREGATE
-        if operation == "aggregate" or not group_col:
-            val_series = working_df[val_col].dropna()
+        # 3. Scalar Aggregate Operation
+        if op == "aggregate":
+            target_col = val or data.select_dtypes(include=[np.number]).columns[0]
+            series = pd.to_numeric(data[target_col], errors="coerce").dropna()
             if agg_func == "mean":
-                result = float(val_series.mean())
+                return float(series.mean()), None
             elif agg_func == "count":
-                result = float(val_series.count())
+                return int(series.count()), None
             elif agg_func == "min":
-                result = float(val_series.min())
+                return float(series.min()), None
             elif agg_func == "max":
-                result = float(val_series.max())
-            elif agg_func == "median":
-                result = float(val_series.median())
-            else:
-                result = float(val_series.sum())
-            return result, None
+                return float(series.max()), None
+            return float(series.sum()), None
 
-        # 2. GROUP BY / TOP-N / TIME-SERIES
-        if group_col not in working_df.columns:
-            available = [c for c in working_df.columns if c != val_col]
-            group_col = available[0] if available else working_df.columns[0]
+        # Resolve columns for grouping operations
+        if not grp or grp not in data.columns:
+            obj_cols = [c for c in data.columns if data[c].dtype == "object" and "id" not in c.lower()]
+            grp = obj_cols[0] if obj_cols else data.columns[0]
 
-        # If temporal column grouping, format clean date representations
-        if "date" in group_col.lower() or pd.api.types.is_datetime64_any_dtype(working_df[group_col]):
+        if not val or val not in data.columns:
+            num_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+            val = num_cols[0] if num_cols else data.columns[-1]
+
+        data[val] = pd.to_numeric(data[val], errors="coerce").fillna(0)
+
+        # 4. GroupBy, Top_N, and Bottom_N Operations
+        if op in ["groupby", "top_n", "bottom_n"]:
+            res = data.groupby(grp)[val].agg(agg_func).reset_index()
+            # Strict sort direction enforcement
+            res = res.sort_values(by=val, ascending=sort_asc)
+            if limit and limit > 0:
+                res = res.head(limit)
+            return res, None
+
+        # 5. Trend (Time-Series) Operation
+        if op == "trend":
             try:
-                working_df[group_col] = pd.to_datetime(working_df[group_col], errors="coerce")
-                working_df = working_df.dropna(subset=[group_col])
-                working_df["_temporal_key"] = working_df[group_col].dt.strftime("%Y-%m")
-                group_col = "_temporal_key"
+                data["_parsed_date"] = pd.to_datetime(data[grp], errors="coerce")
+                data = data.dropna(subset=["_parsed_date"])
+                res = data.groupby(pd.Grouper(key="_parsed_date", freq="M"))[val].agg(agg_func).reset_index()
+                res["_parsed_date"] = res["_parsed_date"].dt.strftime("%Y-%m")
+                res = res.rename(columns={"_parsed_date": grp})
+                res = res.sort_values(by=grp, ascending=True)
+                return res, None
             except Exception:
-                pass
+                res = data.groupby(grp)[val].agg(agg_func).reset_index().sort_values(by=grp)
+                return res, None
 
-        # Perform aggregation
-        grouped = working_df.groupby(group_col, as_index=False)[val_col]
+        # 6. Correlation Operation
+        if op == "correlation":
+            num_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+            if len(num_cols) >= 2:
+                c1 = val if val in num_cols else num_cols[0]
+                c2 = [c for c in num_cols if c != c1][0]
+                corr_val = data[c1].corr(data[c2])
+                corr_df = pd.DataFrame({"Metric 1": [c1], "Metric 2": [c2], "Correlation": [round(corr_val, 3)]})
+                return corr_df, None
 
-        if agg_func == "mean":
-            res_df = grouped.mean()
-        elif agg_func == "count":
-            res_df = grouped.count()
-        elif agg_func == "min":
-            res_df = grouped.min()
-        elif agg_func == "max":
-            res_df = grouped.max()
-        elif agg_func == "median":
-            res_df = grouped.median()
-        else:
-            res_df = grouped.sum()
-
-        # Sort results
-        res_df = res_df.sort_values(by=val_col, ascending=sort_asc)
-
-        # Apply Top-N / Limit truncation
-        if limit and isinstance(limit, int) and limit > 0:
-            res_df = res_df.head(limit)
-
-        if group_col == "_temporal_key":
-            res_df = res_df.rename(columns={"_temporal_key": "Period"})
-
-        res_df = res_df.reset_index(drop=True)
-        return res_df, None
+        # Default fallback
+        res = data.groupby(grp)[val].sum().reset_index().sort_values(by=val, ascending=sort_asc)
+        return res.head(limit or 10), None
 
     except Exception as e:
         return None, f"Execution failed: {str(e)}"

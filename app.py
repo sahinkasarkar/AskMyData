@@ -2,10 +2,11 @@
 app.py
 AskMyData — Pixel-Perfect, Fully-Responsive Analytics Dashboard
 Features:
-- Dedicated "AI Chatbot" page for open-ended dataset questions & business strategy
+- Dynamic headline polarity matching (accurately handles lowest, minimum, highest, and top)
+- Dedicated "AI Chatbot" page with single-spinner prompt activation
+- Fast, non-blocking conversational follow-up and business strategy generation
 - Dual exports: Instant CSV data slice & Print-Ready HTML Executive Brief
-- Conversational follow-up memory across sequential user questions
-- Smart business dimension detection (excludes Order_ID, UUIDs, codes from AI insights)
+- Smart business dimension detection (excludes technical IDs from AI insights)
 - Safe, crash-proof API key discovery across .env, os.environ, and Streamlit secrets
 - Dynamic schema-aware filters, inline dataset cancellation, fluid typography
 - Universal bottom copyright footer
@@ -121,7 +122,6 @@ st.markdown("""
         box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35) !important;
     }
 
-    /* Sidebar In-Card Dataset Box with Inline Cross */
     .sb-dataset-card-inline {
         background: rgba(255, 255, 255, 0.04);
         border: 1px solid rgba(255, 255, 255, 0.08);
@@ -390,7 +390,6 @@ st.markdown("""
         margin-bottom: 18px;
     }
 
-    /* Content Cards */
     .white-card {
         background: #FFFFFF;
         border: 1px solid #E2E8F0;
@@ -400,7 +399,6 @@ st.markdown("""
         box-shadow: 0 1px 2px rgba(0,0,0,0.02);
     }
 
-    /* Compact HTML Table */
     .styled-table {
         width: 100%;
         border-collapse: collapse;
@@ -559,8 +557,7 @@ def get_meaningful_categorical_columns(df: pd.DataFrame) -> list[str]:
 # -----------------------------------------------------------------------------
 def generate_dynamic_insights(df, query, result, quality):
     """
-    Synthesizes contextual AI insights computed directly from active dataset,
-    the user's asked question, and current data quality scores.
+    Synthesizes contextual AI insights computed directly from active dataset.
     """
     insights = []
 
@@ -569,19 +566,31 @@ def generate_dynamic_insights(df, query, result, quality):
             {"title": "Awaiting Dataset", "desc": "Upload a CSV/Excel file or restore sample data to see automated insights.", "type": "neutral"}
         ]
 
+    q_lower = query.lower() if query else ""
+    is_lowest = any(w in q_lower for w in ["lowest", "least", "bottom", "worst", "minimum", "min"])
+
     if isinstance(result, pd.DataFrame) and not result.empty and len(result.columns) >= 2:
         grp_col = result.columns[0]
         val_col = result.columns[1]
-        top_name = str(result.iloc[0][grp_col])
-        top_val = result.iloc[0][val_col]
-        total_val = result[val_col].sum() if pd.api.types.is_numeric_dtype(result[val_col]) else 1
-        pct = (top_val / total_val * 100) if total_val > 0 else 0
         
-        insights.append({
-            "title": f"Top Performer in {grp_col}",
-            "desc": f"For '{query}': <b>{top_name}</b> leads with {top_val:,.0f} ({pct:.1f}% of total {val_col}).",
-            "type": "positive"
-        })
+        target_row = result.iloc[0]
+        entity_name = str(target_row[grp_col])
+        entity_val = target_row[val_col]
+        total_val = result[val_col].sum() if pd.api.types.is_numeric_dtype(result[val_col]) else 1
+        pct = (entity_val / total_val * 100) if total_val > 0 else 0
+        
+        if is_lowest:
+            insights.append({
+                "title": f"Lowest Performer in {grp_col}",
+                "desc": f"For '{query}': <b>{entity_name}</b> recorded lowest {val_col} at {entity_val:,.0f} ({pct:.1f}% of total).",
+                "type": "warning"
+            })
+        else:
+            insights.append({
+                "title": f"Top Performer in {grp_col}",
+                "desc": f"For '{query}': <b>{entity_name}</b> leads with {entity_val:,.0f} ({pct:.1f}% of total {val_col}).",
+                "type": "positive"
+            })
     elif isinstance(result, (int, float)):
         insights.append({
             "title": "Calculated Aggregate",
@@ -651,13 +660,26 @@ def generate_dynamic_recommendations(df, query, result, quality):
             "Include both metric columns (Sales, Profit) and segment columns (Region, Category)."
         ]
 
+    q_lower = query.lower() if query else ""
+    is_lowest = any(w in q_lower for w in ["lowest", "least", "bottom", "worst", "minimum", "min"])
+
     if isinstance(result, pd.DataFrame) and not result.empty and len(result.columns) >= 2:
         grp_col = result.columns[0]
-        top_name = str(result.iloc[0][grp_col])
-        recs.append(f"Focus strategic marketing and resource allocation on <b>{top_name}</b>, which dominates the {grp_col} distribution.")
-        if len(result) > 1:
-            bottom_name = str(result.iloc[-1][grp_col])
-            recs.append(f"Investigate underperformance in <b>{bottom_name}</b> to identify whether low {result.columns[1].lower()} stems from supply gaps or reduced demand.")
+        val_col = result.columns[1]
+        
+        if is_lowest:
+            bottom_row = result.iloc[0]
+            bottom_name = str(bottom_row[grp_col])
+            recs.append(f"Investigate underperformance in <b>{bottom_name}</b> to identify whether low {val_col.lower()} stems from supply gaps, catalog visibility, or marketing deficit.")
+            if len(result) > 1:
+                top_name = str(result.iloc[-1][grp_col])
+                recs.append(f"Compare business practices with <b>{top_name}</b>, which generated the highest volume in this slice.")
+        else:
+            top_name = str(result.iloc[0][grp_col])
+            recs.append(f"Focus strategic marketing and resource allocation on <b>{top_name}</b>, which dominates the {grp_col} distribution.")
+            if len(result) > 1:
+                bottom_name = str(result.iloc[-1][grp_col])
+                recs.append(f"Investigate underperformance in <b>{bottom_name}</b> to eliminate margin leakage or demand friction.")
     else:
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if len(num_cols) >= 2:
@@ -1130,6 +1152,7 @@ if st.session_state.nav_page == "Home":
     if user_triggered:
         st.session_state.current_query = input_query
 
+        # Conversational follow-up context extraction
         prev_context = None
         if st.session_state.last_plan and st.session_state.last_result is not None:
             last_top = None
@@ -1151,11 +1174,18 @@ if st.session_state.nav_page == "Home":
                     st.session_state.last_plan = plan
                     st.session_state.history.insert(0, {"query": input_query, "time": "Just now"})
             else:
+                q_lower = input_query.lower()
+                is_bottom_query = any(w in q_lower for w in ["lowest", "least", "bottom", "worst", "minimum", "min"])
                 num_cols = profile.get("numeric_columns", [])
                 cat_cols = get_meaningful_categorical_columns(df)
                 sample_metric = num_cols[0] if num_cols else df.columns[-1]
                 sample_group = cat_cols[0] if cat_cols else df.columns[0]
-                active_plan = {"operation": "groupby", "group_column": sample_group, "value_column": sample_metric}
+                active_plan = {
+                    "operation": "groupby",
+                    "group_column": sample_group,
+                    "value_column": sample_metric,
+                    "sort_ascending": is_bottom_query
+                }
                 active_res, _ = execute_plan(df, active_plan)
                 st.session_state.last_result = active_res
                 st.session_state.last_plan = active_plan
@@ -1164,14 +1194,28 @@ if st.session_state.nav_page == "Home":
         active_res = st.session_state.last_result
         active_plan = st.session_state.last_plan
 
+        # DYNAMIC HEADLINE WITH POLARITY CHECKING
         if isinstance(active_res, pd.DataFrame) and not active_res.empty:
             first_col = active_res.columns[0]
             val_col = active_res.columns[1] if len(active_res.columns) > 1 else first_col
-            top_entity = active_res.iloc[0][first_col]
-            top_val = active_res.iloc[0][val_col]
-            tot = active_res[val_col].sum() if pd.api.types.is_numeric_dtype(active_res[val_col]) else 1
-            pct = (top_val / tot * 100) if tot > 0 else 0
-            answer_headline = f"{top_entity} leads with total {val_col} at <b>₹{top_val:,.0f}</b> ({pct:.1f}% of filtered total)."
+            
+            q_lower = st.session_state.current_query.lower()
+            is_lowest_ask = any(w in q_lower for w in ["lowest", "least", "bottom", "worst", "minimum", "min"])
+            
+            if is_lowest_ask:
+                target_row = active_res.sort_values(by=val_col, ascending=True).iloc[0]
+                target_entity = target_row[first_col]
+                target_val = target_row[val_col]
+                tot = active_res[val_col].sum() if pd.api.types.is_numeric_dtype(active_res[val_col]) else 1
+                pct = (target_val / tot * 100) if tot > 0 else 0
+                answer_headline = f"<b>{target_entity}</b> has the lowest {val_col} at <b>₹{target_val:,.0f}</b> ({pct:.1f}% of filtered total)."
+            else:
+                target_row = active_res.sort_values(by=val_col, ascending=False).iloc[0]
+                target_entity = target_row[first_col]
+                target_val = target_row[val_col]
+                tot = active_res[val_col].sum() if pd.api.types.is_numeric_dtype(active_res[val_col]) else 1
+                pct = (target_val / tot * 100) if tot > 0 else 0
+                answer_headline = f"<b>{target_entity}</b> leads with total {val_col} at <b>₹{target_val:,.0f}</b> ({pct:.1f}% of filtered total)."
         elif isinstance(active_res, (int, float)):
             answer_headline = f"Calculated value across active records: <b>₹{active_res:,.2f}</b>."
         else:
@@ -1350,27 +1394,23 @@ elif st.session_state.nav_page == "AI Chatbot":
         st.warning("⚠️ No dataset is active. Please upload a dataset from the sidebar to chat with it.")
     else:
         q_cols = st.columns(3)
+        pill_query = None
         with q_cols[0]:
             if st.button("📊 Summarize this dataset", key="chat_pill_1", use_container_width=True):
-                st.session_state.chat_messages.append({"role": "user", "content": "Can you give me a summary of this dataset and its primary patterns?"})
-                with st.spinner("Analyzing..."):
-                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-                st.rerun()
+                pill_query = "Can you give me a summary of this dataset and its primary patterns?"
         with q_cols[1]:
             if st.button("🚨 What anomalies exist?", key="chat_pill_2", use_container_width=True):
-                st.session_state.chat_messages.append({"role": "user", "content": "What anomalies, outliers, or missing values should I be aware of?"})
-                with st.spinner("Analyzing..."):
-                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-                st.rerun()
+                pill_query = "What anomalies, outliers, or missing values should I be aware of?"
         with q_cols[2]:
             if st.button("💡 How can I improve sales?", key="chat_pill_3", use_container_width=True):
-                st.session_state.chat_messages.append({"role": "user", "content": "Based on this data, what concrete steps can I take to improve sales and profit?"})
-                with st.spinner("Analyzing..."):
-                    reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
-                    st.session_state.chat_messages.append({"role": "assistant", "content": reply})
-                st.rerun()
+                pill_query = "Based on this data, what concrete steps can I take to improve sales and profit?"
+
+        if pill_query:
+            st.session_state.chat_messages.append({"role": "user", "content": pill_query})
+            with st.spinner("Analyzing dataset patterns..."):
+                reply = generate_chat_response(st.session_state.chat_messages, df, schema_info, quality)
+                st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+            st.rerun()
 
         st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
 
